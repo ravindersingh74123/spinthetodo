@@ -1,105 +1,166 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getTursoClient, initTursoSchema } from "@/lib/turso";
+import { prisma } from "@/lib/prisma";
+import { getSessionUser } from "@/lib/auth";
+import { Task, LedgerEntry } from "@/lib/types";
 
-export async function GET(req: NextRequest) {
-  const code = req.nextUrl.searchParams.get("code")?.trim().toUpperCase();
-
-  if (!code) {
-    return NextResponse.json(
-      { success: false, error: "Missing sync code parameter" },
-      { status: 400 }
-    );
+export async function GET() {
+  const session = await getSessionUser();
+  if (!session) {
+    return NextResponse.json({
+      success: false,
+      authenticated: false,
+      error: "Authentication required to sync data",
+    });
   }
 
-  const db = getTursoClient();
-  if (!db) {
+  if (!process.env.DATABASE_URL) {
     return NextResponse.json({
       success: false,
       notConfigured: true,
-      error: "Turso is not configured yet. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in environment variables.",
+      error: "DATABASE_URL is not set. Add your Neon DB connection string to environment variables.",
     });
   }
 
   try {
-    await initTursoSchema(db);
-    const result = await db.execute({
-      sql: "SELECT state_json, updated_at FROM user_sync WHERE sync_code = ?",
-      args: [code],
+    const user = await prisma.user.findUnique({
+      where: { id: session.userId },
+      include: {
+        tasks: true,
+        ledger: true,
+      },
     });
 
-    if (result.rows.length === 0) {
-      return NextResponse.json({
-        success: false,
-        notFound: true,
-        message: "No cloud sync session found for this code",
-      });
+    if (!user) {
+      return NextResponse.json(
+        { success: false, error: "User not found" },
+        { status: 404 }
+      );
     }
 
-    const row = result.rows[0];
-    const state = JSON.parse(String(row.state_json));
-    const updatedAt = Number(row.updated_at);
+    const tasks: Task[] = user.tasks.map((t) => ({
+      id: t.id,
+      name: t.name,
+      durationMin: t.durationMin,
+      points: t.points,
+      date: t.date,
+      status: t.status as Task["status"],
+      attempts: t.attempts,
+      startedAt: t.startedAt ? Number(t.startedAt) : undefined,
+      completedAt: t.completedAt ? Number(t.completedAt) : undefined,
+    }));
+
+    const ledger: LedgerEntry[] = user.ledger.map((l) => ({
+      id: l.id,
+      date: l.date,
+      delta: l.delta,
+      reason: l.reason as LedgerEntry["reason"],
+    }));
 
     return NextResponse.json({
       success: true,
-      state,
-      updatedAt,
+      user: {
+        id: user.id,
+        username: user.username,
+      },
+      state: {
+        tasks,
+        ledger,
+        activeTaskId: user.activeTaskId,
+        schemaVersion: 1,
+      },
     });
   } catch (error) {
-    console.error("[Turso Sync GET Error]:", error);
+    console.error("[Sync GET Error]:", error);
     return NextResponse.json(
-      { success: false, error: "Failed to read from Turso cloud" },
+      { success: false, error: "Failed to load user data from Neon DB" },
       { status: 500 }
     );
   }
 }
 
 export async function POST(req: NextRequest) {
+  const session = await getSessionUser();
+  if (!session) {
+    return NextResponse.json(
+      { success: false, authenticated: false, error: "Authentication required" },
+      { status: 401 }
+    );
+  }
+
+  if (!process.env.DATABASE_URL) {
+    return NextResponse.json({
+      success: false,
+      notConfigured: true,
+      error: "DATABASE_URL is not set. Add your Neon DB connection string to environment variables.",
+    });
+  }
+
   try {
     const body = await req.json();
-    const { syncCode, state, updatedAt } = body;
+    const { state } = body;
 
-    if (!syncCode || !state) {
+    if (!state) {
       return NextResponse.json(
-        { success: false, error: "Missing syncCode or state" },
+        { success: false, error: "Missing state payload" },
         { status: 400 }
       );
     }
 
-    const normalizedCode = String(syncCode).trim().toUpperCase();
-    const stateJson = JSON.stringify(state);
-    const timestamp = typeof updatedAt === "number" ? updatedAt : Date.now();
+    const tasksList: Task[] = Array.isArray(state.tasks) ? state.tasks : [];
+    const ledgerList: LedgerEntry[] = Array.isArray(state.ledger) ? state.ledger : [];
+    const activeTaskId: string | null = state.activeTaskId || null;
 
-    const db = getTursoClient();
-    if (!db) {
-      return NextResponse.json({
-        success: false,
-        notConfigured: true,
-        error: "Turso is not configured yet. Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in environment variables.",
+    await prisma.$transaction(async (tx) => {
+      // 1. Update active task
+      await tx.user.update({
+        where: { id: session.userId },
+        data: { activeTaskId },
       });
-    }
 
-    await initTursoSchema(db);
-    await db.execute({
-      sql: `
-        INSERT INTO user_sync (sync_code, state_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(sync_code) DO UPDATE SET
-          state_json = excluded.state_json,
-          updated_at = excluded.updated_at
-        WHERE excluded.updated_at >= user_sync.updated_at;
-      `,
-      args: [normalizedCode, stateJson, timestamp],
+      // 2. Replace user tasks
+      await tx.task.deleteMany({ where: { userId: session.userId } });
+      if (tasksList.length > 0) {
+        await tx.task.createMany({
+          data: tasksList.map((t) => ({
+            id: t.id,
+            userId: session.userId,
+            name: t.name,
+            durationMin: t.durationMin,
+            points: t.points,
+            date: t.date,
+            status: t.status,
+            attempts: t.attempts || 0,
+            startedAt: t.startedAt ? Number(t.startedAt) : null,
+            completedAt: t.completedAt ? Number(t.completedAt) : null,
+          })),
+        });
+      }
+
+      // 3. Replace user ledger
+      await tx.ledgerEntry.deleteMany({ where: { userId: session.userId } });
+      if (ledgerList.length > 0) {
+        await tx.ledgerEntry.createMany({
+          data: ledgerList.map((l) => ({
+            id: l.id,
+            userId: session.userId,
+            date: l.date,
+            delta: l.delta,
+            reason: l.reason,
+          })),
+        });
+      }
     });
 
     return NextResponse.json({
       success: true,
-      syncCode: normalizedCode,
-      updatedAt: timestamp,
+      message: "Synced with Neon DB",
+      taskCount: tasksList.length,
+      ledgerCount: ledgerList.length,
     });
   } catch (error) {
-    console.error("[Turso Sync POST Error]:", error);
+    console.error("[Sync POST Error]:", error);
     return NextResponse.json(
-      { success: false, error: "Failed to write to Turso cloud" },
+      { success: false, error: "Failed to save data to Neon DB" },
       { status: 500 }
     );
   }

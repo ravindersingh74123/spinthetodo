@@ -4,11 +4,11 @@ import React, { useState, useMemo } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useAppState } from "@/store/useAppState";
-import SyncModal from "./SyncModal";
+import AuthModal from "./AuthModal";
 
 export default function Header() {
   const pathname = usePathname();
-  const [isSyncOpen, setIsSyncOpen] = useState(false);
+  const [isAuthOpen, setIsAuthOpen] = useState(false);
   const {
     activeTask,
     totalPoints,
@@ -80,12 +80,12 @@ export default function Header() {
             </Link>
             <button
               type="button"
-              onClick={() => setIsSyncOpen(true)}
+              onClick={() => setIsAuthOpen(true)}
               className="px-3.5 sm:px-4 py-1.5 sm:py-2 text-xs font-bold tracking-[0.032em] uppercase rounded-full border border-carbon bg-paper-white text-carbon hover:bg-soft-mist transition-all cursor-pointer flex items-center gap-1.5"
-              title="Sync tasks between laptop and phone"
+              title="Sync with Neon DB / Account"
             >
-              <span>🔄</span>
-              <span className="hidden md:inline">Sync</span>
+              <span>⚡</span>
+              <span className="hidden md:inline">Account</span>
             </button>
           </nav>
 
@@ -177,7 +177,7 @@ export default function Header() {
         </div>
       </div>
 
-      <SyncModal isOpen={isSyncOpen} onClose={() => setIsSyncOpen(false)} />
+      <AuthModal isOpen={isAuthOpen} onClose={() => setIsAuthOpen(false)} />
     </header>
   );
 }
